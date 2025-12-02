@@ -1,0 +1,26 @@
+{
+  "name": "my-serene-life",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A private, holistic PWA for daily life and secure connection",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "deploy": "vite build && touch dist/.nojekyll && echo 'Deployed to GitHub Pages'"
+  },
+  "dependencies": {
+    "firebase": "^12.6.0",
+    "lucide-react": "^0.445.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "autoprefixer": "^10.4.22",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.16",
+    "vite": "^5.4.8",
+    "vite-plugin-pwa": "^0.20.5"
+  }
+}
