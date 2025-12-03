@@ -1,0 +1,1 @@
+if('serviceWorker' in navigator) {window.addEventListener('load', () => {navigator.serviceWorker.register('/my-chiquita-app/sw.js', { scope: '/my-chiquita-app/' })})}
