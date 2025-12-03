@@ -1,0 +1,4 @@
+# Icon placeholder - Replace these files with actual icons
+# Create 192x192px and 512x512px PNG icons for your PWA
+# You can use a tool like https://realfavicongenerator.net/ 
+# or create them manually in any image editor
