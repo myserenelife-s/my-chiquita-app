@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Home, Calendar, Heart, Send, Moon, MessageCircle, CloudSun, UploadCloud, ChevronRight, Check, Target, RefreshCw, Plus, Clock, Volume2, Mic, Book, Star, Sparkles, Scissors, ExternalLink, Bookmark, Compass, Bell, Navigation, Lock } from 'lucide-react';
 import { ALLAH_NAMES, getTodaysName } from './allahNames';
 import { HIJAB_STYLES, getTodaysStyle } from './hijabStyles';
-import { db, auth, signInAnonymously } from './firebase';
+import { db, auth, signInAnonymously, requestFCMToken, onForegroundMessage } from './firebase';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, setDoc, deleteDoc, getDocs } from 'firebase/firestore';
 
 // --- CONFIGURATION AND SETUP ---
@@ -569,6 +569,42 @@ export default function App() {
     const [gratitudeEntries, setGratitudeEntries] = useState(() => getFromStorage(STORAGE_KEYS.GRATITUDE, []));
     const [prayerTimes, setPrayerTimes] = useState(null);
     const [prayerTimesLoading, setPrayerTimesLoading] = useState(true);
+    const [notificationsEnabled, setNotificationsEnabled] = useState(() => {
+        return 'Notification' in window && Notification.permission === 'granted';
+    });
+    const [fcmToken, setFcmToken] = useState(() => {
+        return localStorage.getItem('fcm_token') || null;
+    });
+
+    // Request notification permission and FCM token
+    const requestNotificationPermission = async () => {
+        try {
+            const token = await requestFCMToken();
+            if (token) {
+                setFcmToken(token);
+                localStorage.setItem('fcm_token', token);
+                setNotificationsEnabled(true);
+                
+                // Store token in Firestore for this user
+                await setDoc(doc(db, 'user_tokens', userId), {
+                    token: token,
+                    userId: userId,
+                    timestamp: serverTimestamp()
+                });
+                
+                setStatusMessage('✅ Push notifications enabled! You will receive notifications even when the app is closed.');
+                setTimeout(() => setStatusMessage(''), 4000);
+            } else {
+                setNotificationsEnabled(false);
+                setStatusMessage('❌ Could not enable notifications. Please check browser permissions.');
+                setTimeout(() => setStatusMessage(''), 3000);
+            }
+        } catch (error) {
+            console.error('Notification permission error:', error);
+            setStatusMessage('❌ Error enabling notifications.');
+            setTimeout(() => setStatusMessage(''), 3000);
+        }
+    };
 
     // Handle password authentication
     const handlePasswordSubmit = async (e) => {
@@ -595,7 +631,13 @@ export default function App() {
     useEffect(() => {
         if (isAuthenticated) {
             signInAnonymously(auth)
-                .then(() => setIsAuthReady(true))
+                .then(() => {
+                    setIsAuthReady(true);
+                    // Request notification permission after authentication
+                    if ('Notification' in window && Notification.permission === 'default') {
+                        requestNotificationPermission();
+                    }
+                })
                 .catch((error) => {
                     console.error('Auth error:', error);
                     setIsAuthenticated(false);
@@ -603,6 +645,22 @@ export default function App() {
                 });
         }
     }, [isAuthenticated]); 
+
+    // Handle foreground FCM messages
+    useEffect(() => {
+        if (!isAuthReady) return;
+
+        const unsubscribe = onForegroundMessage((payload) => {
+            console.log('Foreground FCM message:', payload);
+            
+            const title = payload.notification?.title || '💬 New Message';
+            const body = payload.notification?.body || 'You have a new message';
+            
+            showNotification(title, body, true);
+        });
+
+        return unsubscribe;
+    }, [isAuthReady]); 
 
     // 1. Load initial data from localStorage
     useEffect(() => {
@@ -663,7 +721,13 @@ export default function App() {
                     if (msg.senderId !== userId && chatMessages.length > 0) {
                         // Decrypt for notification
                         const decryptedText = await decryptMessage(msg.text);
-                        showNotification('New Message', decryptedText);
+                        const previewText = decryptedText.length > 50 ? decryptedText.substring(0, 50) + '...' : decryptedText;
+                        showNotification('💬 New Message from Partner', previewText, true);
+                        
+                        // Vibrate for received messages (longer pattern)
+                        if ('vibrate' in navigator) {
+                            navigator.vibrate([100, 50, 100]);
+                        }
                     }
                 }
             }
@@ -851,9 +915,11 @@ export default function App() {
         e.preventDefault();
         if (!chatInput.trim()) return;
 
+        const messageText = chatInput.trim();
+        
         try {
             // Encrypt the message before sending
-            const encryptedText = await encryptMessage(chatInput.trim());
+            const encryptedText = await encryptMessage(messageText);
             
             if (!encryptedText) {
                 setStatusMessage('Failed to encrypt message.');
@@ -864,11 +930,35 @@ export default function App() {
             const newMessage = {
                 text: encryptedText, // Store encrypted text
                 senderId: userId,
-                timestamp: serverTimestamp()
+                timestamp: serverTimestamp(),
+                // Add metadata for push notification
+                senderName: 'Your Partner',
+                preview: messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText
             };
             
             await addDoc(collection(db, 'chat_messages'), newMessage);
             setChatInput('');
+            
+            // Show notification for sent message
+            showNotification('Message Sent ✓', messageText.length > 50 ? messageText.substring(0, 50) + '...' : messageText);
+            
+            // Vibrate if supported
+            if ('vibrate' in navigator) {
+                navigator.vibrate(50);
+            }
+            
+            // Trigger push notification for other user via Cloud Function
+            // This will be handled by Firebase Cloud Function
+            try {
+                await addDoc(collection(db, 'push_notifications'), {
+                    senderId: userId,
+                    message: messageText.substring(0, 100),
+                    timestamp: serverTimestamp(),
+                    processed: false
+                });
+            } catch (notifError) {
+                console.log('Push notification trigger failed:', notifError);
+            }
         } catch (error) {
             console.error('Error sending message:', error);
             setStatusMessage('Failed to send message. Please try again.');
@@ -877,21 +967,40 @@ export default function App() {
     };
 
     // Show browser notification
-    const showNotification = (title, body) => {
+    const showNotification = (title, body, isReceived = false) => {
         if ('Notification' in window && Notification.permission === 'granted') {
-            new Notification(title, {
+            const notification = new Notification(title, {
                 body: body,
                 icon: '/icon-192.png',
                 badge: '/icon-192.png',
-                tag: 'chat-message',
-                requireInteraction: false
+                tag: isReceived ? 'received-message' : 'sent-message',
+                requireInteraction: false,
+                silent: false,
+                timestamp: Date.now()
             });
-            // Play notification sound
+            
+            // Auto-close notification after 5 seconds
+            setTimeout(() => notification.close(), 5000);
+            
+            // Play notification sound (different for sent vs received)
             try {
-                const audio = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBDGH0fPTgjMGHm7A7+OZSA0PVKXh8bllHAU2jdXzzn0pBSh+zPLaizsKGGS56+mvVxYLRJre8L9nIAQxhtLz1YU2Bhxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWUcBTaN1fPNgCoFKX7N8tqKOQkXZLzs6a9XFgtEmt7wv2cgBDGG0vPVhTYGHGq+7uacSA8OU6Tg8bllHAU2jdXzzYAqBSl+zfLaijkJF2S87OmvVxYLRJre8L9nIAQxhtLz1YU2BRxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWUcBTaN1fPNgCoFKX7N8tqKOQkXZLzs6a9XFgtEmt7wv2cgBDGG0vPVhTYGHGq+7uacSA8OU6Tg8bllHAU2jdXzzYAqBSl+zfLaijkJF2S87OmvVxYLRJre8L9nIAQxhtLz1YU2BRxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWUcBTaN1fPNgCoFKX7N8tqKOQkXZLzs6a9XFgtEmt7wv2cgBDGG0vPVhTYGHGq+7uacSA8OU6Tg8bllHAU2jdXzzYAqBSl+zfLaijkJF2S87OmvVxYLRJre8L9nIAQxhtLz1YU2BRxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWUcBTaN1fPNgCoFKX7N8tqKOQkXZLzs6a9XFgtEmt7wv2cgBDGG0vPVhTYGHGq+7uacSA8OU6Tg8bllHAU2jdXzzYAqBSl+zfLaijkJF2S87OmvVxYLRJre8L9nIAQxhtLz1YU2BRxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWUcBTaN1fPNgCoFKX7N8tqKOQkXZLzs6a9XFgtEmt7wv2cgBDGG0vPVhTYGHGq+7uacSA8OU6Tg8bllHAU2jdXzzYAqBSl+zfLaijkJF2S87OmvVxYLRJre8L9nIAQxhtLz1YU2BRxqvu7mnEgPDlOk4PG5ZRwFNo3V882AKgUpfs3y2oo5CRdkvOzpr1cWC0Sa3vC/ZyAEMYbS89WFNgYcar7u5pxIDw5TpODxuWU=');
-                audio.play().catch(e => console.log('Audio play failed:', e));
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.frequency.value = isReceived ? 800 : 600; // Higher pitch for received
+                oscillator.type = 'sine';
+                
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.2);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.2);
             } catch (e) {
-                console.log('Notification sound failed:', e);
+                console.log('Audio notification failed:', e);
             }
         }
     };
@@ -974,19 +1083,19 @@ export default function App() {
         <button
             className={`flex flex-col items-center p-2 transition-all duration-300 ${
                 activeTab === tabName
-                    ? 'text-amber-700 border-t-2 border-amber-600 bg-gradient-to-b from-amber-50/60 to-transparent'
-                    : 'text-stone-400 hover:text-amber-600'
+                    ? 'text-neon-green-400 border-t-2 border-neon-green-500 bg-gradient-to-b from-dark-emerald-900/60 to-transparent shadow-neon-sm'
+                    : 'text-gray-500 hover:text-neon-green-400'
             }`}
             onClick={() => setActiveTab(tabName)}
         >
-            <Icon size={24} strokeWidth={2} className="mb-0.5" />
+            <Icon size={24} strokeWidth={2} className={`mb-0.5 ${activeTab === tabName ? 'drop-shadow-[0_0_6px_rgba(34,197,94,0.8)]' : ''}`} />
             <span className="text-xs font-medium">{label}</span>
         </button>
     );
 
     const Card = ({ title, children, className = '' }) => (
-        <div className={`p-6 mb-4 bg-stone-50/60 backdrop-blur-xl rounded-2xl shadow-lg border border-stone-200/20 ${className}`}>
-            <h2 className="mb-4 text-xl font-semibold bg-gradient-to-r from-amber-700 to-stone-600 bg-clip-text text-transparent border-b border-stone-200/50 pb-3">{title}</h2>
+        <div className={`p-6 mb-4 bg-deep-black-card/60 backdrop-blur-xl rounded-2xl shadow-neon border border-neon-green-500/20 ${className}`}>
+            <h2 className="mb-4 text-xl font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent border-b border-neon-green-500/30 pb-3 glow-text">{title}</h2>
             {children}
         </div>
     );
@@ -994,13 +1103,13 @@ export default function App() {
     // NEW COMPONENT: DHIKR COUNTER
     const DhikrCounter = () => (
         <div className="space-y-4 text-center">
-            <Card title={t("dhikrTitle")} className="bg-gradient-to-br from-lime-50/40 to-green-50/40">
-                <p className="text-sm italic text-stone-600 mb-6">
+            <Card title={t("dhikrTitle")}>
+                <p className="text-sm italic text-gray-400 mb-6">
                     {t("dhikrSubtitle")}
                 </p>
                 <div className="my-8">
-                    <p className="text-xl font-medium bg-gradient-to-r from-lime-600 to-green-600 bg-clip-text text-transparent">{t("dhikrTotal")}</p>
-                    <p className="text-8xl font-extrabold bg-gradient-to-br from-lime-600 via-green-600 to-emerald-600 bg-clip-text text-transparent font-mono tracking-tighter">
+                    <p className="text-xl font-medium bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">{t("dhikrTotal")}</p>
+                    <p className="text-8xl font-extrabold bg-gradient-to-br from-neon-green-glow via-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent font-mono tracking-tighter glow-text">
                         {dhikrCount}
                     </p>
                 </div>
@@ -1008,14 +1117,14 @@ export default function App() {
                 <div className="flex justify-center space-x-4">
                     <button
                         onClick={handleDhikrClick}
-                        className="p-8 bg-gradient-to-br from-lime-500 to-green-600 text-white rounded-full shadow-2xl hover:shadow-lime-500/50 transition-all transform hover:scale-105 active:scale-95"
+                        className="p-8 bg-gradient-to-br from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-full shadow-neon-lg hover:shadow-neon-xl transition-all transform hover:scale-105 active:scale-95 animate-glow"
                         aria-label="Increment Dhikr Count"
                     >
                         <Plus size={36} />
                     </button>
                     <button
                         onClick={handleResetDhikr}
-                        className="p-3 bg-stone-100/80 backdrop-blur-sm text-lime-700 rounded-full shadow-md hover:bg-stone-200/80 transition-all flex items-center justify-center border border-stone-200"
+                        className="p-3 bg-dark-emerald-900/60 backdrop-blur-sm text-neon-green-400 rounded-full shadow-neon-sm hover:bg-dark-emerald-800/80 transition-all flex items-center justify-center border border-neon-green-500/30"
                         aria-label="Reset Dhikr Count"
                     >
                         <RefreshCw size={24} />
@@ -1053,27 +1162,27 @@ export default function App() {
         return (
             <div className="space-y-4">
                 {/* Today's Name Card */}
-                <Card title={t("todaysName")} className="bg-gradient-to-br from-amber-50/40 to-orange-50/40">
+                <Card title={t("todaysName")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <div className="text-center py-6">
                         <div className="mb-2">
-                            <span className="inline-block px-3 py-1 bg-amber-100/60 text-amber-800 text-xs font-semibold rounded-full">
+                            <span className="inline-block px-3 py-1 bg-dark-emerald-900/60 text-neon-green-400 text-xs font-semibold rounded-full border border-neon-green-500/30">
                                 {t("nameNumber")} {todaysName.number}/99
                             </span>
                         </div>
-                        <h2 className="text-6xl font-bold text-amber-900 mb-3 font-serif">{todaysName.arabic}</h2>
-                        <p className="text-2xl font-semibold bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent mb-1">
+                        <h2 className="text-6xl font-bold text-neon-green-400 mb-3 font-serif glow-text">{todaysName.arabic}</h2>
+                        <p className="text-2xl font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent mb-1 glow-text">
                             {todaysName.transliteration}
                         </p>
-                        <p className="text-lg text-stone-700 mb-4 italic">"{todaysName.meaning}"</p>
-                        <div className="bg-stone-50/50 backdrop-blur-sm p-4 rounded-xl border border-amber-100/40 mb-4">
-                            <p className="text-sm text-stone-600 leading-relaxed">{todaysName.reflection}</p>
+                        <p className="text-lg text-gray-300 mb-4 italic">"{todaysName.meaning}"</p>
+                        <div className="bg-deep-black-card/50 backdrop-blur-sm p-4 rounded-xl border border-neon-green-500/30 mb-4">
+                            <p className="text-sm text-gray-400 leading-relaxed">{todaysName.reflection}</p>
                         </div>
                         <button
                             onClick={() => toggleLearned(todaysName.number)}
-                            className={`px-6 py-3 rounded-full font-semibold transition-all shadow-lg ${
+                            className={`px-6 py-3 rounded-full font-semibold transition-all shadow-neon-lg ${
                                 learnedNames.includes(todaysName.number)
-                                    ? 'bg-gradient-to-r from-lime-500 to-green-500 text-white'
-                                    : 'bg-gradient-to-r from-amber-500 to-orange-600 text-white hover:shadow-amber-500/50'
+                                    ? 'bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black animate-glow'
+                                    : 'bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black hover:shadow-neon-xl animate-glow'
                             }`}
                         >
                             {learnedNames.includes(todaysName.number) ? (
@@ -1086,26 +1195,26 @@ export default function App() {
                 </Card>
 
                 {/* Progress Card */}
-                <Card title={t("progressTitle")} className="bg-gradient-to-br from-rose-50/40 to-orange-50/40">
+                <Card title={t("progressTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <div className="flex items-center justify-between mb-2">
-                        <span className="text-sm font-medium text-stone-700">{learnedNames.length}/99 {t("learned")}</span>
-                        <span className="text-2xl font-bold bg-gradient-to-r from-rose-600 to-orange-600 bg-clip-text text-transparent">
+                        <span className="text-sm font-medium text-gray-300">{learnedNames.length}/99 {t("learned")}</span>
+                        <span className="text-2xl font-bold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">
                             {progress}%
                         </span>
                     </div>
-                    <div className="w-full h-3 bg-stone-200 rounded-full overflow-hidden">
+                    <div className="w-full h-3 bg-deep-black-card/50 rounded-full overflow-hidden border border-neon-green-500/20">
                         <div 
-                            className="h-full bg-gradient-to-r from-rose-500 to-orange-500 transition-all duration-500 rounded-full"
+                            className="h-full bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 transition-all duration-500 rounded-full shadow-neon-sm"
                             style={{ width: `${progress}%` }}
                         />
                     </div>
                 </Card>
 
                 {/* Browse All Names */}
-                <Card title={t("allNames")} className="bg-gradient-to-br from-stone-50/40 to-amber-50/40">
+                <Card title={t("allNames")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <button
                         onClick={() => setShowAll(!showAll)}
-                        className="w-full mb-4 px-4 py-3 bg-gradient-to-r from-amber-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:shadow-amber-500/50 transition-all flex items-center justify-center"
+                        className="w-full mb-4 px-4 py-3 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-xl font-semibold hover:shadow-neon-xl transition-all flex items-center justify-center shadow-neon-lg animate-glow"
                     >
                         <Book size={18} className="mr-2" />
                         {showAll ? 'Hide' : t("browseAll")}
@@ -1118,7 +1227,7 @@ export default function App() {
                                 placeholder={t("searchNames")}
                                 value={searchTerm}
                                 onChange={(e) => setSearchTerm(e.target.value)}
-                                className="w-full p-3 border border-amber-200/40 bg-stone-50/40 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-amber-300/50 focus:border-amber-300 transition-all"
+                                className="w-full p-3 border border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 transition-all text-gray-100 placeholder-gray-500"
                             />
                             <div className="max-h-96 overflow-y-auto space-y-2">
                                 {filteredNames.map(name => (
@@ -1126,31 +1235,31 @@ export default function App() {
                                         key={name.number}
                                         className={`p-4 rounded-xl border transition-all ${
                                             learnedNames.includes(name.number)
-                                                ? 'bg-gradient-to-r from-lime-50/60 to-green-50/60 border-lime-200/60'
-                                                : 'bg-stone-50/70 backdrop-blur-sm border-stone-200 hover:border-amber-300'
+                                                ? 'bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 border-neon-green-500/50 shadow-neon-sm'
+                                                : 'bg-deep-black-card/70 backdrop-blur-sm border-neon-green-500/20 hover:border-neon-green-500/40'
                                         }`}
                                     >
                                         <div className="flex justify-between items-start mb-2">
                                             <div className="flex-1">
                                                 <div className="flex items-center gap-2 mb-1">
-                                                    <span className="text-xs font-bold text-stone-500">#{name.number}</span>
-                                                    <span className="text-2xl font-bold text-amber-900 font-serif">{name.arabic}</span>
+                                                    <span className="text-xs font-bold text-gray-500">#{name.number}</span>
+                                                    <span className="text-2xl font-bold text-neon-green-400 font-serif glow-text">{name.arabic}</span>
                                                 </div>
-                                                <p className="text-lg font-semibold text-orange-700">{name.transliteration}</p>
-                                                <p className="text-sm text-stone-600 italic">"{name.meaning}"</p>
+                                                <p className="text-lg font-semibold text-dark-emerald-400">{name.transliteration}</p>
+                                                <p className="text-sm text-gray-400 italic">"{name.meaning}"</p>
                                             </div>
                                             <button
                                                 onClick={() => toggleLearned(name.number)}
                                                 className={`p-2 rounded-full transition-all ${
                                                     learnedNames.includes(name.number)
-                                                        ? 'bg-lime-600 text-white'
-                                                        : 'bg-stone-200 text-stone-600 hover:bg-amber-500 hover:text-white'
+                                                        ? 'bg-neon-green-600 text-deep-black shadow-neon-sm'
+                                                        : 'bg-dark-emerald-900/60 text-neon-green-400 hover:bg-neon-green-600 hover:text-deep-black border border-neon-green-500/30'
                                                 }`}
                                             >
                                                 {learnedNames.includes(name.number) ? <Check size={16} /> : <Star size={16} />}
                                             </button>
                                         </div>
-                                        <p className="text-xs text-stone-500 mt-2">{name.reflection}</p>
+                                        <p className="text-xs text-gray-500 mt-2">{name.reflection}</p>
                                     </div>
                                 ))}
                             </div>
@@ -1207,11 +1316,11 @@ export default function App() {
         return (
             <div className="space-y-4">
                 {/* Today's Style Inspiration */}
-                <Card title={t("todaysStyle")} className="bg-gradient-to-br from-rose-50/40 to-orange-50/40">
+                <Card title={t("todaysStyle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <div className="space-y-4">
                         <div className="flex items-start justify-between">
                             <div className="flex-1">
-                                <h3 className="text-2xl font-bold bg-gradient-to-r from-rose-600 to-orange-600 bg-clip-text text-transparent mb-2">
+                                <h3 className="text-2xl font-bold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent mb-2 glow-text">
                                     {todaysStyle.name}
                                 </h3>
                                 <div className="flex gap-2 mb-3">
@@ -1227,23 +1336,23 @@ export default function App() {
                                 onClick={() => toggleSaved(todaysStyle.id)}
                                 className={`p-2 rounded-full transition-all ${
                                     savedOutfits.includes(todaysStyle.id)
-                                        ? 'bg-rose-500 text-white'
-                                        : 'bg-stone-200 text-stone-600 hover:bg-rose-500 hover:text-white'
+                                        ? 'bg-neon-green-500 text-deep-black shadow-neon-sm'
+                                        : 'bg-dark-emerald-900/60 text-neon-green-400 hover:bg-neon-green-500 hover:text-deep-black border border-neon-green-500/30'
                                 }`}
                             >
-                                <Bookmark size={18} fill={savedOutfits.includes(todaysStyle.id) ? 'white' : 'none'} />
+                                <Bookmark size={18} fill={savedOutfits.includes(todaysStyle.id) ? 'currentColor' : 'none'} />
                             </button>
                         </div>
 
-                        <div className="bg-stone-50/50 backdrop-blur-sm p-4 rounded-xl border border-rose-100/40">
-                            <p className="text-sm text-stone-700 leading-relaxed mb-3">{todaysStyle.description}</p>
+                        <div className="bg-deep-black-card/50 backdrop-blur-sm p-4 rounded-xl border border-neon-green-500/30">
+                            <p className="text-sm text-gray-300 leading-relaxed mb-3">{todaysStyle.description}</p>
                             <div className="mb-3">
-                                <p className="text-xs font-semibold text-rose-700 mb-1">💡 {t("tips")}:</p>
-                                <p className="text-xs text-stone-600 italic">{todaysStyle.tips}</p>
+                                <p className="text-xs font-semibold text-neon-green-400 mb-1">💡 {t("tips")}:</p>
+                                <p className="text-xs text-gray-400 italic">{todaysStyle.tips}</p>
                             </div>
                             <div className="mb-3">
-                                <p className="text-xs font-semibold text-orange-700 mb-1">📅 {t("occasions")}:</p>
-                                <p className="text-xs text-stone-600">{todaysStyle.occasions}</p>
+                                <p className="text-xs font-semibold text-dark-emerald-400 mb-1">📅 {t("occasions")}:</p>
+                                <p className="text-xs text-gray-400">{todaysStyle.occasions}</p>
                             </div>
                         </div>
 
@@ -1251,7 +1360,7 @@ export default function App() {
                             href={todaysStyle.tutorial}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="flex items-center justify-center gap-2 w-full py-3 bg-gradient-to-r from-rose-500 to-orange-600 text-white rounded-xl font-semibold hover:shadow-lg hover:shadow-rose-500/50 transition-all"
+                            className="flex items-center justify-center gap-2 w-full py-3 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-xl font-semibold hover:shadow-neon-xl transition-all shadow-neon-lg animate-glow"
                         >
                             <ExternalLink size={18} />
                             {t("watchTutorial")}
@@ -1260,10 +1369,10 @@ export default function App() {
                 </Card>
 
                 {/* My Outfit Planner */}
-                <Card title={t("myOutfitPlanner")} className="bg-gradient-to-br from-orange-50/40 to-amber-50/40">
+                <Card title={t("myOutfitPlanner")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <button
                         onClick={() => setShowPlanner(!showPlanner)}
-                        className="w-full mb-4 px-4 py-3 bg-gradient-to-r from-orange-500 to-amber-600 text-white rounded-xl font-semibold hover:shadow-lg hover:shadow-orange-500/50 transition-all flex items-center justify-center gap-2"
+                        className="w-full mb-4 px-4 py-3 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-xl font-semibold hover:shadow-neon-xl transition-all flex items-center justify-center gap-2 shadow-neon-lg animate-glow"
                     >
                         <Bookmark size={18} />
                         {showPlanner ? 'Hide Planner' : `${t("myOutfitPlanner")} (${savedStyles.length})`}
@@ -1272,39 +1381,39 @@ export default function App() {
                     {showPlanner && (
                         <div className="space-y-3">
                             {savedStyles.length === 0 ? (
-                                <p className="text-sm text-stone-500 italic text-center py-6">{t("noSavedOutfits")}</p>
+                                <p className="text-sm text-gray-400 italic text-center py-6">{t("noSavedOutfits")}</p>
                             ) : (
                                 <div className="space-y-2 max-h-96 overflow-y-auto">
                                     {savedStyles.map(style => (
                                         <div 
                                             key={style.id}
-                                            className="p-4 bg-stone-50/70 backdrop-blur-sm rounded-xl border border-orange-200/60 hover:border-orange-300 transition-all"
+                                            className="p-4 bg-deep-black-card/70 backdrop-blur-sm rounded-xl border border-neon-green-500/30 hover:border-neon-green-500/50 transition-all"
                                         >
                                             <div className="flex justify-between items-start mb-2">
                                                 <div className="flex-1">
-                                                    <h4 className="font-semibold text-orange-700 mb-1">{style.name}</h4>
+                                                    <h4 className="font-semibold text-neon-green-400 mb-1">{style.name}</h4>
                                                     <div className="flex gap-2 mb-2">
                                                         <span className={`px-2 py-0.5 rounded-full text-xs ${getDifficultyColor(style.difficulty)}`}>
                                                             {t(style.difficulty)}
                                                         </span>
-                                                        <span className="px-2 py-0.5 rounded-full text-xs bg-orange-100 text-orange-700">
+                                                        <span className="px-2 py-0.5 rounded-full text-xs bg-dark-emerald-900/60 text-neon-green-400 border border-neon-green-500/30">
                                                             {t(style.category)}
                                                         </span>
                                                     </div>
-                                                    <p className="text-xs text-stone-600 mb-2">{style.occasions}</p>
+                                                    <p className="text-xs text-gray-400 mb-2">{style.occasions}</p>
                                                 </div>
                                                 <button
                                                     onClick={() => toggleSaved(style.id)}
-                                                    className="p-2 rounded-full bg-rose-500 text-white hover:bg-rose-600 transition-all"
+                                                    className="p-2 rounded-full bg-neon-green-500 text-deep-black hover:bg-neon-green-600 transition-all shadow-neon-sm"
                                                 >
-                                                    <Bookmark size={14} fill="white" />
+                                                    <Bookmark size={14} fill="currentColor" />
                                                 </button>
                                             </div>
                                             <a
                                                 href={style.tutorial}
                                                 target="_blank"
                                                 rel="noopener noreferrer"
-                                                className="text-xs text-orange-600 hover:text-orange-800 flex items-center gap-1 font-medium"
+                                                className="text-xs text-neon-green-400 hover:text-neon-green-300 flex items-center gap-1 font-medium"
                                             >
                                                 <ExternalLink size={12} />
                                                 {t("watchTutorial")}
@@ -1318,9 +1427,9 @@ export default function App() {
                 </Card>
 
                 {/* Browse All Styles */}
-                <Card title={t("allStyles")} className="bg-gradient-to-br from-stone-50/40 to-sky-50/40">
+                <Card title={t("allStyles")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <div className="mb-4">
-                        <p className="text-sm font-medium text-stone-700 mb-2">{t("styleCategories")}</p>
+                        <p className="text-sm font-medium text-gray-300 mb-2">{t("styleCategories")}</p>
                         <div className="flex flex-wrap gap-2">
                             {['all', 'casual', 'formal', 'elegant', 'sporty', 'modest', 'modern'].map(cat => (
                                 <button
@@ -1328,8 +1437,8 @@ export default function App() {
                                     onClick={() => setSelectedCategory(cat)}
                                     className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all ${
                                         selectedCategory === cat
-                                            ? 'bg-gradient-to-r from-rose-500 to-orange-500 text-white shadow-md'
-                                            : 'bg-stone-100 text-stone-600 hover:bg-stone-200'
+                                            ? 'bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black shadow-neon-sm'
+                                            : 'bg-dark-emerald-900/60 text-neon-green-400 hover:bg-dark-emerald-800/80 border border-neon-green-500/30'
                                     }`}
                                 >
                                     {cat === 'all' ? t("allStyles") : t(cat)}
@@ -1342,40 +1451,40 @@ export default function App() {
                         {filteredStyles.map(style => (
                             <div 
                                 key={style.id}
-                                className="p-4 bg-stone-50/70 backdrop-blur-sm rounded-xl border border-stone-200 hover:border-rose-300 transition-all"
+                                className="p-4 bg-deep-black-card/70 backdrop-blur-sm rounded-xl border border-neon-green-500/20 hover:border-neon-green-500/40 transition-all"
                             >
                                 <div className="flex justify-between items-start mb-2">
                                     <div className="flex-1">
-                                        <h4 className="font-semibold bg-gradient-to-r from-stone-700 to-amber-600 bg-clip-text text-transparent mb-1">
+                                        <h4 className="font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent mb-1">
                                             {style.name}
                                         </h4>
                                         <div className="flex gap-2 mb-2">
                                             <span className={`px-2 py-0.5 rounded-full text-xs ${getDifficultyColor(style.difficulty)}`}>
                                                 {t(style.difficulty)}
                                             </span>
-                                            <span className="px-2 py-0.5 rounded-full text-xs bg-amber-100/60 text-amber-800">
+                                            <span className="px-2 py-0.5 rounded-full text-xs bg-dark-emerald-900/60 text-neon-green-400 border border-neon-green-500/30">
                                                 {t(style.category)}
                                             </span>
                                         </div>
-                                        <p className="text-xs text-stone-600 mb-2">{style.description}</p>
-                                        <p className="text-xs text-stone-500 italic">📅 {style.occasions}</p>
+                                        <p className="text-xs text-gray-400 mb-2">{style.description}</p>
+                                        <p className="text-xs text-gray-500 italic">📅 {style.occasions}</p>
                                     </div>
                                     <button
                                         onClick={() => toggleSaved(style.id)}
                                         className={`p-2 rounded-full transition-all ml-2 ${
                                             savedOutfits.includes(style.id)
-                                                ? 'bg-rose-500 text-white'
-                                                : 'bg-stone-200 text-stone-600 hover:bg-rose-500 hover:text-white'
+                                                ? 'bg-neon-green-500 text-deep-black shadow-neon-sm'
+                                                : 'bg-dark-emerald-900/60 text-neon-green-400 hover:bg-neon-green-500 hover:text-deep-black border border-neon-green-500/30'
                                         }`}
                                     >
-                                        <Bookmark size={14} fill={savedOutfits.includes(style.id) ? 'white' : 'none'} />
+                                        <Bookmark size={14} fill={savedOutfits.includes(style.id) ? 'currentColor' : 'none'} />
                                     </button>
                                 </div>
                                 <a
                                     href={style.tutorial}
                                     target="_blank"
                                     rel="noopener noreferrer"
-                                    className="text-xs text-rose-600 hover:text-rose-800 flex items-center gap-1 font-medium"
+                                    className="text-xs text-neon-green-400 hover:text-neon-green-300 flex items-center gap-1 font-medium"
                                 >
                                     <ExternalLink size={12} />
                                     {t("watchTutorial")}
@@ -1406,41 +1515,41 @@ export default function App() {
         const pastEntries = gratitudeEntries.filter(e => new Date(e.timestamp).toDateString() !== today);
 
         return (
-            <Card title={t("gratitudeTitle")} className="bg-gradient-to-br from-rose-100/40 via-orange-50/40 to-amber-50/40">
+            <Card title={t("gratitudeTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                 <form onSubmit={handleSubmit} className="mb-4">
                     <textarea
                         value={entry}
                         onChange={(e) => setEntry(e.target.value)}
                         placeholder={t("gratitudePlaceholder")}
                         rows="3"
-                        className="w-full p-3 border border-orange-200/40 bg-stone-50/50 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-orange-300/40 focus:border-orange-300 transition-all"
+                        className="w-full p-3 border border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 transition-all text-gray-100 placeholder-gray-500"
                     />
                     <button
                         type="submit"
-                        className="mt-2 w-full py-3 text-white bg-gradient-to-r from-orange-400 to-amber-500 rounded-xl shadow-lg hover:shadow-orange-400/40 transition-all font-semibold disabled:opacity-50"
+                        className="mt-2 w-full py-3 text-deep-black bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 rounded-xl shadow-neon-lg hover:shadow-neon-xl transition-all font-semibold disabled:opacity-50 animate-glow"
                         disabled={!entry.trim()}
                     >
                         {t("logGratitudeButton")}
                     </button>
                 </form>
 
-                <h3 className="text-lg font-semibold bg-gradient-to-r from-stone-600 to-amber-600 bg-clip-text text-transparent border-t border-stone-100 pt-2 mt-4">{t("historyTitle")}</h3>
+                <h3 className="text-lg font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent border-t border-neon-green-500/30 pt-2 mt-4 glow-text">{t("historyTitle")}</h3>
                 <ul className="max-h-40 overflow-y-auto space-y-2 mt-2 text-sm">
                     {todaysEntry && (
-                        <li className="p-3 bg-gradient-to-r from-orange-100/60 to-amber-100/60 backdrop-blur-sm rounded-xl shadow-sm font-medium text-orange-900 flex items-center border border-orange-200/40">
+                        <li className="p-3 bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 backdrop-blur-sm rounded-xl shadow-neon-sm font-medium text-neon-green-400 flex items-center border border-neon-green-500/40">
                             <Clock size={16} className="mr-2" />
                             {todaysEntry.entry}
                         </li>
                     )}
                     {pastEntries.length > 0 ? (
                         pastEntries.map((log) => (
-                            <li key={log.id} className="p-2 bg-stone-50/60 backdrop-blur-sm rounded-lg border-l-4 border-stone-300 text-stone-700">
-                                <p className="text-xs italic text-stone-500 mb-1">{new Date(log.timestamp).toLocaleDateString()}</p>
+                            <li key={log.id} className="p-2 bg-deep-black-card/60 backdrop-blur-sm rounded-lg border-l-4 border-neon-green-500/30 text-gray-300">
+                                <p className="text-xs italic text-gray-500 mb-1">{new Date(log.timestamp).toLocaleDateString()}</p>
                                 {log.entry}
                             </li>
                         ))
                     ) : (
-                        <p className="text-stone-500 italic">{t("noGratitude")}</p>
+                        <p className="text-gray-500 italic">{t("noGratitude")}</p>
                     )}
                 </ul>
             </Card>
@@ -1450,17 +1559,17 @@ export default function App() {
 
     const BeautyTrends = () => (
         <div className="space-y-4">
-            <Card title={t("beautyTitle")} className="bg-gradient-to-br from-orange-50/40 via-rose-50/40 to-amber-50/40">
-                <p className="text-sm text-stone-600">
+            <Card title={t("beautyTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                <p className="text-sm text-gray-400">
                     {t("beautySubtitle")}
                 </p>
             </Card>
             {BEAUTY_TRENDS_KEYS.map((keys, index) => (
-                <div key={index} className="p-4 bg-gradient-to-br from-rose-50/40 to-orange-50/40 backdrop-blur-sm rounded-xl shadow-md border border-rose-100/40 transition-shadow hover:shadow-lg">
-                    <h3 className="mb-2 text-lg font-medium bg-gradient-to-r from-rose-600 to-orange-600 bg-clip-text text-transparent flex items-center">
-                        <Heart size={20} className="mr-2 text-rose-400" /> {t(keys.titleKey)}
+                <div key={index} className="p-4 bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40 backdrop-blur-sm rounded-xl shadow-neon border border-neon-green-500/20 transition-shadow hover:shadow-neon-lg">
+                    <h3 className="mb-2 text-lg font-medium bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent flex items-center glow-text">
+                        <Heart size={20} className="mr-2 text-neon-green-400" /> {t(keys.titleKey)}
                     </h3>
-                    <p className="text-stone-700 text-sm">{t(keys.descKey)}</p>
+                    <p className="text-gray-300 text-sm">{t(keys.descKey)}</p>
                 </div>
             ))}
         </div>
@@ -1468,21 +1577,21 @@ export default function App() {
 
     const EarthquakeAdvisories = () => (
         <div className="space-y-4">
-            <Card title={t("earthquakeTitle")} className="bg-gradient-to-br from-amber-50/40 via-yellow-50/40 to-orange-50/40">
-                <div className="p-4 bg-gradient-to-r from-amber-50/60 to-yellow-50/60 backdrop-blur-sm rounded-xl border border-amber-200/40">
-                    <p className="font-semibold text-amber-800 mb-2">{t("importantNotice")}</p>
-                    <p className="text-sm text-stone-700">
+            <Card title={t("earthquakeTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                <div className="p-4 bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 backdrop-blur-sm rounded-xl border border-neon-green-500/30">
+                    <p className="font-semibold text-neon-green-400 mb-2">{t("importantNotice")}</p>
+                    <p className="text-sm text-gray-300">
                         {t("advisoryNote1")}
                     </p>
-                    <p className="mt-3 text-sm text-red-600 font-bold">
+                    <p className="mt-3 text-sm text-red-400 font-bold">
                         {t("advisoryNote2")}
                     </p>
                 </div>
-                <Card title={t("checklistTitle")} className="bg-gradient-to-br from-lime-50/40 via-green-50/40 to-emerald-50/40">
-                    <ul className="text-sm space-y-2 text-stone-700">
-                        <li className="flex items-center"><Check size={16} className="text-lime-600 mr-2" /> {t("checklist1")}</li>
-                        <li className="flex items-center"><Check size={16} className="text-lime-600 mr-2" /> {t("checklist2")}</li>
-                        <li className="flex items-center"><Check size={16} className="text-lime-600 mr-2" /> {t("checklist3")}</li>
+                <Card title={t("checklistTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                    <ul className="text-sm space-y-2 text-gray-300">
+                        <li className="flex items-center"><Check size={16} className="text-neon-green-400 mr-2" /> {t("checklist1")}</li>
+                        <li className="flex items-center"><Check size={16} className="text-neon-green-400 mr-2" /> {t("checklist2")}</li>
+                        <li className="flex items-center"><Check size={16} className="text-neon-green-400 mr-2" /> {t("checklist3")}</li>
                     </ul>
                 </Card>
             </Card>
@@ -1495,19 +1604,19 @@ export default function App() {
         
         return (
             <div className="space-y-4">
-                <Card title={t("dailyReflectionTitle")} className="bg-gradient-to-br from-orange-50/50 via-amber-50/50 to-yellow-50/40">
-                    <p className="text-sm italic text-stone-600 mb-4">
+                <Card title={t("dailyReflectionTitle")} className="bg-gradient-to-br from-dark-emerald-900/50 to-dark-emerald-950/50">
+                    <p className="text-sm italic text-gray-400 mb-4">
                         {t("dailyReflectionSubtitle")}
                     </p>
                     {/* Today's Rotating Verse */}
-                    <div className="p-5 bg-gradient-to-br from-amber-50/50 to-orange-50/40 backdrop-blur-sm rounded-2xl border border-amber-100/40">
-                        <h3 className="mb-2 text-lg font-medium bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent">
+                    <div className="p-5 bg-gradient-to-br from-dark-emerald-900/50 to-dark-emerald-950/40 backdrop-blur-sm rounded-2xl border border-neon-green-500/30">
+                        <h3 className="mb-2 text-lg font-medium bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">
                             {language === 'tr' ? todaysVerse.themeTr : todaysVerse.theme}
                         </h3>
-                        <p className="text-stone-700 leading-relaxed italic mb-2">
+                        <p className="text-gray-300 leading-relaxed italic mb-2">
                             "{language === 'tr' ? todaysVerse.verseTr : todaysVerse.verse}"
                         </p>
-                        <p className="text-sm font-semibold bg-gradient-to-r from-amber-600 to-orange-500 bg-clip-text text-transparent">
+                        <p className="text-sm font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent">
                             {language === 'tr' ? todaysVerse.referenceTr : todaysVerse.reference}
                         </p>
                     </div>
@@ -1654,7 +1763,7 @@ export default function App() {
         return (
             <div className="space-y-4">
                 {/* Qibla Direction Finder */}
-                <Card title={t("qiblaTitle")} className={`bg-gradient-to-br ${getTimeBasedBackground()} relative overflow-hidden`}>
+                <Card title={t("qiblaTitle")} className={`bg-gradient-to-br ${getTimeBasedBackground()} relative overflow-hidden border border-neon-green-500/30`}>
                     {/* Stars for night time */}
                     {isNightTime && (
                         <div className="absolute inset-0 pointer-events-none">
@@ -1676,19 +1785,19 @@ export default function App() {
                     )}
 
                     <div className="relative z-10">
-                        <p className={`text-sm mb-4 ${isNightTime ? 'text-white' : 'text-stone-600'}`}>
+                        <p className={`text-sm mb-4 ${isNightTime ? 'text-white' : 'text-gray-400'}`}>
                             {t("qiblaSubtitle")}
                         </p>
 
                         {!hasLocation ? (
                             <div className="text-center py-8">
-                                <Navigation size={48} className={`mx-auto mb-4 ${isNightTime ? 'text-white' : 'text-stone-400'}`} />
-                                <p className={`text-sm mb-4 ${isNightTime ? 'text-white' : 'text-stone-600'}`}>
+                                <Navigation size={48} className={`mx-auto mb-4 ${isNightTime ? 'text-white' : 'text-neon-green-400'}`} />
+                                <p className={`text-sm mb-4 ${isNightTime ? 'text-white' : 'text-gray-400'}`}>
                                     {t("locationRequired")}
                                 </p>
                                 <button
                                     onClick={() => window.location.reload()}
-                                    className="px-4 py-2 bg-gradient-to-r from-sky-500 to-blue-500 text-white rounded-xl font-semibold hover:shadow-lg transition-all"
+                                    className="px-4 py-2 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-xl font-semibold hover:shadow-neon-lg transition-all animate-glow"
                                 >
                                     {t("enableLocation")}
                                 </button>
@@ -1750,17 +1859,17 @@ export default function App() {
                 </Card>
 
                 {/* Prayer Times with Next Prayer Highlight */}
-                <Card title={t("prayerTitle")} className="bg-gradient-to-br from-sky-50/40 via-blue-50/40 to-cyan-50/40">
+                <Card title={t("prayerTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                     <div className="flex items-center justify-between mb-4">
                         <div>
-                            <p className="text-sm text-stone-600">
-                                {t("prayerCurrentTime")}: <span className="font-mono bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent font-bold">{currentTime}</span>
+                            <p className="text-sm text-gray-400">
+                                {t("prayerCurrentTime")}: <span className="font-mono bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent font-bold glow-text">{currentTime}</span>
                             </p>
                         </div>
                         {!notificationsEnabled && (
                             <button
                                 onClick={requestNotifications}
-                                className="flex items-center gap-1 px-3 py-1 bg-gradient-to-r from-sky-400 to-blue-400 text-white text-xs rounded-full font-semibold hover:shadow-lg transition-all"
+                                className="flex items-center gap-1 px-3 py-1 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black text-xs rounded-full font-semibold hover:shadow-neon-lg transition-all animate-glow"
                             >
                                 <Bell size={12} />
                                 {t("enableNotifications")}
@@ -1769,24 +1878,24 @@ export default function App() {
                     </div>
 
                     {/* Next Prayer Alert */}
-                    <div className="mb-4 p-4 bg-gradient-to-r from-sky-100/60 to-blue-100/60 backdrop-blur-sm rounded-xl border-2 border-sky-300/60 shadow-lg">
+                    <div className="mb-4 p-4 bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 backdrop-blur-sm rounded-xl border-2 border-neon-green-500/60 shadow-neon-lg">
                         <div className="flex items-center justify-between">
                             <div>
-                                <p className="text-xs font-semibold text-sky-700">{t("nextPrayer")}</p>
-                                <p className="text-2xl font-bold bg-gradient-to-r from-sky-600 to-blue-600 bg-clip-text text-transparent">
+                                <p className="text-xs font-semibold text-neon-green-400">{t("nextPrayer")}</p>
+                                <p className="text-2xl font-bold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">
                                     {nextPrayer.name}
                                 </p>
                             </div>
                             <div className="text-right">
-                                <p className="text-xs font-semibold text-sky-700">{t("timeUntilPrayer")}</p>
-                                <p className="text-xl font-bold text-sky-600">{nextPrayer.timeLeft}</p>
+                                <p className="text-xs font-semibold text-neon-green-400">{t("timeUntilPrayer")}</p>
+                                <p className="text-xl font-bold text-neon-green-400">{nextPrayer.timeLeft}</p>
                             </div>
                         </div>
                     </div>
 
                     <ul className="space-y-3">
                         {prayerTimesLoading ? (
-                            <li className="text-center py-4 text-stone-500">
+                            <li className="text-center py-4 text-gray-400">
                                 {t("calculating")}
                             </li>
                         ) : prayerTimes && Object.entries(prayerTimes).map(([name, time]) => {
@@ -1796,23 +1905,23 @@ export default function App() {
                                     key={name} 
                                     className={`flex items-center justify-between p-4 backdrop-blur-sm rounded-xl shadow-sm border transition-all ${
                                         isNext 
-                                            ? 'bg-gradient-to-r from-sky-100/60 to-blue-100/60 border-sky-300/60 shadow-md scale-105' 
-                                            : 'bg-gradient-to-r from-stone-50/60 to-amber-50/60 border-stone-200/40'
+                                            ? 'bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 border-neon-green-500/60 shadow-neon-md scale-105' 
+                                            : 'bg-deep-black-card/60 border-neon-green-500/20'
                                     }`}
                                 >
                                     <span className={`font-medium ${
-                                        isNext ? 'text-sky-700' : 'text-stone-700'
+                                        isNext ? 'text-neon-green-400' : 'text-gray-300'
                                     }`}>{name}</span>
                                     <span className={`text-lg font-semibold ${
                                         isNext 
-                                            ? 'bg-gradient-to-r from-sky-600 to-blue-600 bg-clip-text text-transparent' 
-                                            : 'bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent'
+                                            ? 'bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text' 
+                                            : 'bg-gradient-to-r from-gray-300 to-gray-400 bg-clip-text text-transparent'
                                     }`}>{time}</span>
                                 </li>
                             );
                         })}
                     </ul>
-                    <p className="mt-4 text-xs italic text-stone-500">
+                    <p className="mt-4 text-xs italic text-gray-500">
                         {prayerTimesLoading ? t("calculating") : 'Times based on your location using Aladhan API'}
                     </p>
                 </Card>
@@ -1822,42 +1931,42 @@ export default function App() {
 
     const PeriodCalendar = () => (
         <div className="space-y-4">
-            <Card title={t("periodTrackerTitle")} className="bg-gradient-to-br from-rose-50/40 via-orange-50/40 to-pink-50/40">
-                <p className="mb-3 text-sm text-stone-600">{t("periodTrackerSubtitle")}</p>
+            <Card title={t("periodTrackerTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                <p className="mb-3 text-sm text-gray-400">{t("periodTrackerSubtitle")}</p>
 
-                <div className="flex items-center space-x-2 p-3 bg-gradient-to-r from-rose-50/40 to-orange-50/40 backdrop-blur-sm rounded-xl mb-4 border border-rose-100/40">
+                <div className="flex items-center space-x-2 p-3 bg-gradient-to-r from-dark-emerald-900/40 to-dark-emerald-950/40 backdrop-blur-sm rounded-xl mb-4 border border-neon-green-500/30">
                     <input
                         type="date"
                         value={newPeriodDate}
                         onChange={(e) => setNewPeriodDate(e.target.value)}
-                        className="flex-grow p-2 border border-rose-200/40 bg-stone-50/40 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-rose-300/40 focus:border-rose-300"
+                        className="flex-grow p-2 border border-neon-green-500/30 bg-deep-black-card/40 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 text-gray-100"
                     />
                     <button
                         onClick={handleAddPeriodDate}
-                        className="px-4 py-2 text-white bg-gradient-to-r from-rose-400 to-orange-400 rounded-lg shadow-lg hover:shadow-rose-400/40 transition-all flex items-center"
+                        className="px-4 py-2 text-deep-black bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 rounded-lg shadow-neon-lg hover:shadow-neon-xl transition-all flex items-center animate-glow"
                     >
                         <Check size={20} className="mr-1" /> {t("logButton")}
                     </button>
                 </div>
             </Card>
 
-            <Card title={t("cyclePredictionsTitle")} className="bg-gradient-to-br from-amber-50/40 via-orange-50/40 to-yellow-50/40">
-                <div className="text-stone-700 space-y-2">
-                    <p>{t("lastRecorded")} <span className="font-semibold bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent">{periodData.length > 0 ? new Date(periodData[0]).toDateString() : 'N/A'}</span></p>
-                    <p>{t("predictedNext")} <span className="font-semibold bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent">{getCycleInfo.nextPeriod || t("calculating")}</span></p>
-                    <p>{t("estimatedOvulation")} <span className="font-semibold bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent">{getCycleInfo.ovulation || t("calculating")}</span></p>
+            <Card title={t("cyclePredictionsTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                <div className="text-gray-300 space-y-2">
+                    <p>{t("lastRecorded")} <span className="font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">{periodData.length > 0 ? new Date(periodData[0]).toDateString() : 'N/A'}</span></p>
+                    <p>{t("predictedNext")} <span className="font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">{getCycleInfo.nextPeriod || t("calculating")}</span></p>
+                    <p>{t("estimatedOvulation")} <span className="font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">{getCycleInfo.ovulation || t("calculating")}</span></p>
                 </div>
             </Card>
 
-            <Card title={t("historyTitle")} className="bg-gradient-to-br from-stone-50/40 via-neutral-50/40 to-amber-50/40">
+            <Card title={t("historyTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                 <ul className="max-h-40 overflow-y-auto space-y-1">
                     {periodData.length === 0 ? (
-                        <p className="text-stone-500 italic">{t("noPeriods")}</p>
+                        <p className="text-gray-400 italic">{t("noPeriods")}</p>
                     ) : (
                         periodData.map((date, index) => (
-                            <li key={index} className="flex items-center justify-between text-sm p-1 border-b border-stone-100">
-                                <span className="text-stone-600 font-mono">{new Date(date).toLocaleDateString()}</span>
-                                <ChevronRight size={14} className="text-amber-500" />
+                            <li key={index} className="flex items-center justify-between text-sm p-1 border-b border-neon-green-500/20">
+                                <span className="text-gray-400 font-mono">{new Date(date).toLocaleDateString()}</span>
+                                <ChevronRight size={14} className="text-neon-green-400" />
                             </li>
                         ))
                     )}
@@ -1868,8 +1977,8 @@ export default function App() {
 
     const SpecialMoments = () => (
         <div className="space-y-4">
-            <Card title={t("momentsUploadTitle")} className="bg-gradient-to-br from-amber-50/40 via-orange-50/40 to-yellow-50/40">
-                <p className="text-sm text-stone-600 mb-4">
+            <Card title={t("momentsUploadTitle")} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                <p className="text-sm text-gray-400 mb-4">
                     {t("momentsUploadSubtitle")}
                 </p>
                 <label className="block">
@@ -1878,25 +1987,25 @@ export default function App() {
                         type="file"
                         accept="image/*,video/*"
                         onChange={handleMomentUpload}
-                        className="block w-full text-sm text-amber-800 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gradient-to-r file:from-amber-50 file:to-orange-50 file:text-amber-800 hover:file:from-amber-100 hover:file:to-orange-100 file:transition-all"
+                        className="block w-full text-sm text-neon-green-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-gradient-to-r file:from-neon-green-500 file:to-dark-emerald-600 file:text-deep-black hover:file:shadow-neon-lg file:transition-all"
                     />
                 </label>
             </Card>
 
-            <Card title={`${t("momentsTitle")} (${moments.length})`} className="bg-gradient-to-br from-stone-50/40 via-amber-50/40 to-orange-50/40">
+            <Card title={`${t("momentsTitle")} (${moments.length})`} className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
                 <div className="grid grid-cols-2 gap-3 max-h-80 overflow-y-auto">
                     {moments.length === 0 ? (
-                        <p className="text-stone-500 italic col-span-2">{t("noMoments")}</p>
+                        <p className="text-gray-400 italic col-span-2">{t("noMoments")}</p>
                     ) : (
                         moments.map((moment) => (
-                            <div key={moment.id} className="relative aspect-square rounded-xl overflow-hidden shadow-lg bg-gradient-to-br from-stone-100/60 to-amber-100/60 backdrop-blur-sm border border-stone-200/50">
+                            <div key={moment.id} className="relative aspect-square rounded-xl overflow-hidden shadow-neon bg-gradient-to-br from-deep-black-card/60 to-dark-emerald-900/60 backdrop-blur-sm border border-neon-green-500/30">
                                 {moment.fileType.startsWith('image/') ? (
                                     <img src={moment.url} alt="Moment" className="object-cover w-full h-full" loading="lazy" />
                                 ) : (
                                     <video src={moment.url} controls className="object-cover w-full h-full" />
                                 )}
-                                <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-stone-900/70 via-stone-900/40 to-transparent backdrop-blur-sm">
-                                    <span className="text-xs text-white font-medium drop-shadow-lg">{new Date(moment.timestamp).toLocaleDateString()}</span>
+                                <div className="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-deep-black/90 via-deep-black/60 to-transparent backdrop-blur-sm">
+                                    <span className="text-xs text-neon-green-400 font-medium drop-shadow-lg">{new Date(moment.timestamp).toLocaleDateString()}</span>
                                 </div>
                             </div>
                         ))
@@ -2008,21 +2117,21 @@ export default function App() {
 
         return (
             <div className="space-y-4">
-                <Card title="Quran Recitation (Online)" className="bg-gradient-to-br from-amber-50/40 to-orange-50/40">
-                    <p className="text-sm italic text-stone-600 mb-4">
+                <Card title="Quran Recitation (Online)" className="bg-gradient-to-br from-dark-emerald-900/40 to-dark-emerald-950/40">
+                    <p className="text-sm italic text-gray-400 mb-4">
                         Listen to complete Surah recitations from renowned reciters. Requires internet connection.
                     </p>
 
                     {/* Surah Selector */}
                     <div className="mb-4">
-                        <label htmlFor="surahSelector" className="block text-sm font-medium text-stone-700 mb-2">
+                        <label htmlFor="surahSelector" className="block text-sm font-medium text-gray-300 mb-2">
                             Choose Surah
                         </label>
                         <select 
                             id="surahSelector" 
                             value={selectedSurah}
                             onChange={(e) => setSelectedSurah(Number(e.target.value))}
-                            className="w-full p-3 border border-amber-200/40 bg-stone-50/50 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-amber-300/50 focus:border-amber-300 appearance-none pr-8 cursor-pointer"
+                            className="w-full p-3 border border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 appearance-none pr-8 cursor-pointer text-gray-100"
                         >
                             {popularSurahs.map((surah) => (
                                 <option key={surah.number} value={surah.number}>
@@ -2034,14 +2143,14 @@ export default function App() {
 
                     {/* Reciter Selector */}
                     <div className="mb-6">
-                        <label htmlFor="reciterSelector" className="block text-sm font-medium text-stone-700 mb-2">
+                        <label htmlFor="reciterSelector" className="block text-sm font-medium text-gray-300 mb-2">
                             Choose Reciter
                         </label>
                         <select 
                             id="reciterSelector" 
                             value={selectedReciter}
                             onChange={(e) => setSelectedReciter(e.target.value)}
-                            className="w-full p-3 border border-amber-200/40 bg-stone-50/50 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-amber-300/50 focus:border-amber-300 appearance-none pr-8 cursor-pointer"
+                            className="w-full p-3 border border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-lg focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 appearance-none pr-8 cursor-pointer text-gray-100"
                         >
                             {reciters.map((reciter) => (
                                 <option key={reciter.id} value={reciter.id}>
@@ -2055,7 +2164,7 @@ export default function App() {
                     <button 
                         onClick={loadAudio}
                         disabled={isLoading}
-                        className="w-full bg-gradient-to-r from-amber-500 to-orange-600 hover:shadow-amber-500/50 text-white font-semibold py-3 px-4 rounded-lg transition-all duration-300 shadow-lg flex items-center justify-center disabled:opacity-50"
+                        className="w-full bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 hover:shadow-neon-xl text-deep-black font-semibold py-3 px-4 rounded-lg transition-all duration-300 shadow-neon-lg flex items-center justify-center disabled:opacity-50 animate-glow"
                     >
                         {isLoading ? (
                             <>
@@ -2075,17 +2184,17 @@ export default function App() {
 
                     {/* Error Message */}
                     {error && (
-                        <div className="mt-4 p-3 bg-rose-50/80 backdrop-blur-sm text-rose-700 rounded-xl text-center font-medium border border-rose-200/50">
+                        <div className="mt-4 p-3 bg-red-950/50 backdrop-blur-sm text-red-400 rounded-xl text-center font-medium border border-red-500/50">
                             {error}
                         </div>
                     )}
 
                     {/* Audio Player */}
                     {audioUrls.length > 0 && (
-                        <div className="mt-4 p-4 bg-gradient-to-r from-amber-50/60 to-orange-50/60 backdrop-blur-sm rounded-xl border border-amber-200/40">
+                        <div className="mt-4 p-4 bg-gradient-to-r from-dark-emerald-900/60 to-dark-emerald-950/60 backdrop-blur-sm rounded-xl border border-neon-green-500/40">
                             <div className="flex items-center justify-between mb-2">
-                                <p className="text-sm font-semibold text-stone-800">Now Playing:</p>
-                                <p className="text-xs text-stone-600">
+                                <p className="text-sm font-semibold text-neon-green-400">Now Playing:</p>
+                                <p className="text-xs text-gray-400">
                                     Ayah {currentAyahIndex + 1} / {audioUrls.length}
                                 </p>
                             </div>
@@ -2098,15 +2207,15 @@ export default function App() {
                                 <source src={audioUrls[currentAyahIndex]} type="audio/mpeg" />
                                 Your browser does not support the audio element.
                             </audio>
-                            <p className="text-xs text-stone-500 mt-2 italic">
+                            <p className="text-xs text-gray-500 mt-2 italic">
                                 ✨ Full Surah playback - Each ayah will play automatically one after another
                             </p>
                         </div>
                     )}
 
                     {/* Info Box */}
-                    <div className="mt-4 p-3 bg-amber-50/50 rounded-lg border border-amber-100/40">
-                        <p className="text-xs text-stone-600">
+                    <div className="mt-4 p-3 bg-dark-emerald-900/50 rounded-lg border border-neon-green-500/30">
+                        <p className="text-xs text-gray-400">
                             🌐 Audio provided by <strong>alquran.cloud</strong> - A free, open-source Quran API
                         </p>
                     </div>
@@ -2334,24 +2443,40 @@ export default function App() {
                 return <SpecialMoments />;
             case 'Chat':
                 return (
-                    <div className="flex flex-col h-[70vh] max-h-[70vh] bg-stone-50/60 backdrop-blur-xl rounded-2xl shadow-xl border border-stone-200/20">
-                        <div className="p-4 border-b border-stone-200/50 bg-gradient-to-r from-amber-500/10 to-orange-500/10 backdrop-blur-sm rounded-t-2xl">
-                            <h2 className="text-lg font-semibold bg-gradient-to-r from-amber-700 to-orange-600 bg-clip-text text-transparent">{t("chatTitle")}</h2>
-                            <p className="text-xs text-stone-500">End-to-end encrypted 🔐 • Private & secure • Notifications enabled 🔔</p>
+                    <div className="flex flex-col h-[70vh] max-h-[70vh] bg-deep-black-card/60 backdrop-blur-xl rounded-2xl shadow-neon border border-neon-green-500/20">
+                        <div className="p-4 border-b border-neon-green-500/30 bg-gradient-to-r from-neon-green-500/10 to-dark-emerald-600/10 backdrop-blur-sm rounded-t-2xl">
+                            <div className="flex items-center justify-between">
+                                <div className="flex-1">
+                                    <h2 className="text-lg font-semibold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">{t("chatTitle")}</h2>
+                                    <p className="text-xs text-gray-400">
+                                        End-to-end encrypted 🔐 • Private & secure 
+                                        {notificationsEnabled && <span className="ml-1">• <span className="text-neon-green-400 animate-pulse">●</span> Notifications ON</span>}
+                                    </p>
+                                </div>
+                                {!notificationsEnabled && (
+                                    <button
+                                        onClick={requestNotificationPermission}
+                                        className="px-3 py-1.5 text-xs bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-full shadow-neon-sm hover:shadow-neon transition-all font-semibold flex items-center gap-1"
+                                    >
+                                        <Bell size={14} />
+                                        Enable
+                                    </button>
+                                )}
+                            </div>
                         </div>
                         <div className="flex-grow p-4 space-y-4 overflow-y-auto custom-scrollbar">
                             {chatMessages.length === 0 ? (
-                                <p className="text-center text-stone-500 italic mt-8">{t("chatStart")}</p>
+                                <p className="text-center text-gray-400 italic mt-8">{t("chatStart")}</p>
                             ) : (
                                 chatMessages.map((msg) => (
                                     <div key={msg.id} className={`flex ${msg.senderId === userId ? 'justify-end' : 'justify-start'}`}>
-                                        <div className={`max-w-[75%] px-4 py-3 rounded-2xl shadow-lg backdrop-blur-sm ${
+                                        <div className={`max-w-[75%] px-4 py-3 rounded-2xl shadow-neon backdrop-blur-sm ${
                                             msg.senderId === userId
-                                                ? 'bg-gradient-to-r from-amber-500 to-orange-600 text-white rounded-br-none'
-                                                : 'bg-stone-100/80 text-stone-800 rounded-tl-none border border-stone-200/50'
+                                                ? 'bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-br-none border border-neon-green-500/50'
+                                                : 'bg-deep-black-card/80 text-gray-100 rounded-tl-none border border-neon-green-500/30'
                                         }`}>
                                             <p className="text-sm">{decryptedMessages[msg.id] || 'Decrypting...'}</p>
-                                            <span className={`text-xs block mt-1 ${msg.senderId === userId ? 'text-amber-100' : 'text-stone-400'}`}>
+                                            <span className={`text-xs block mt-1 ${msg.senderId === userId ? 'text-deep-black/80' : 'text-gray-500'}`}>
                                                 {msg.timestamp?.toDate ? new Date(msg.timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
                                             </span>
                                         </div>
@@ -2360,19 +2485,19 @@ export default function App() {
                             )}
                             <div ref={messagesEndRef} />
                         </div>
-                        <form onSubmit={handleSendMessage} className="p-4 border-t flex space-x-2">
+                        <form onSubmit={handleSendMessage} className="p-4 border-t border-neon-green-500/30 flex space-x-2">
                             <input
                                 type="text"
                                 value={chatInput}
                                 onChange={(e) => setChatInput(e.target.value)}
                                 placeholder={t("chatPlaceholder")}
-                                className="flex-grow p-3 border border-stone-200/50 bg-stone-50/50 backdrop-blur-sm rounded-full focus:ring-2 focus:ring-amber-300/50 focus:border-amber-300"
+                                className="flex-grow p-3 border border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-full focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 text-gray-100 placeholder-gray-500"
                                 disabled={!isAuthReady}
                                 autoComplete="off"
                             />
                             <button
                                 type="submit"
-                                className="p-3 text-white bg-gradient-to-r from-amber-500 to-orange-600 rounded-full shadow-xl hover:shadow-amber-500/50 transition-all disabled:opacity-50"
+                                className="p-3 text-deep-black bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 rounded-full shadow-neon-xl hover:shadow-neon-2xl transition-all disabled:opacity-50 animate-glow"
                                 disabled={!isAuthReady || !chatInput.trim()}
                             >
                                 <Send size={24} />
@@ -2386,26 +2511,31 @@ export default function App() {
     };
 
     return (
-        <div className="min-h-screen bg-gradient-to-br from-amber-50 via-stone-50 to-sky-50 flex flex-col font-sans">
+        <div className="min-h-screen bg-deep-black flex flex-col font-sans relative overflow-hidden">
+            {/* Animated background particles */}
+            <div className="fixed inset-0 pointer-events-none">
+                <div className="absolute inset-0 bg-gradient-to-br from-deep-black via-dark-emerald-950 to-deep-black"></div>
+            </div>
+            
             {/* Password Lock Screen */}
             {!isAuthenticated && (
-                <div className="fixed inset-0 bg-gradient-to-br from-amber-100 via-stone-100 to-sky-100 flex items-center justify-center z-50 p-4">
-                    <div className="bg-white/90 backdrop-blur-xl rounded-3xl shadow-2xl p-8 max-w-md w-full border border-amber-200/50">
+                <div className="fixed inset-0 bg-gradient-to-br from-deep-black via-dark-emerald-950 to-deep-black flex items-center justify-center z-50 p-4">
+                    <div className="bg-deep-black-card/90 backdrop-blur-xl rounded-3xl shadow-neon-xl p-8 max-w-md w-full border border-neon-green-500/30 glow-border">
                         <div className="text-center mb-8">
-                            <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-br from-amber-500 to-orange-600 rounded-full mb-4 shadow-lg">
-                                <Lock size={40} className="text-white" />
+                            <div className="inline-flex items-center justify-center w-20 h-20 bg-gradient-to-br from-neon-green-500 to-dark-emerald-600 rounded-full mb-4 shadow-neon-lg animate-glow">
+                                <Lock size={40} className="text-deep-black" />
                             </div>
-                            <h1 className="text-3xl font-bold bg-gradient-to-r from-amber-700 to-stone-600 bg-clip-text text-transparent mb-2">
+                            <h1 className="text-3xl font-bold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent mb-2 glow-text">
                                 My Serene Life
                             </h1>
-                            <p className="text-sm italic text-rose-600">
+                            <p className="text-sm italic text-neon-green-400">
                                 With all my love for you my Queen ❤️
                             </p>
                         </div>
                         
                         <form onSubmit={handlePasswordSubmit} className="space-y-4">
                             <div>
-                                <label htmlFor="password" className="block text-sm font-medium text-stone-700 mb-2">
+                                <label htmlFor="password" className="block text-sm font-medium text-gray-300 mb-2">
                                     Enter Password
                                 </label>
                                 <input
@@ -2414,26 +2544,26 @@ export default function App() {
                                     value={passwordInput}
                                     onChange={(e) => setPasswordInput(e.target.value)}
                                     placeholder="Enter your password"
-                                    className="w-full p-4 border-2 border-amber-200/50 bg-stone-50/50 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-amber-400 focus:border-amber-400 transition-all text-center text-lg"
+                                    className="w-full p-4 border-2 border-neon-green-500/30 bg-deep-black-card/50 backdrop-blur-sm rounded-xl focus:ring-2 focus:ring-neon-green-500 focus:border-neon-green-500 transition-all text-center text-lg text-gray-100 placeholder-gray-500"
                                     autoFocus
                                 />
                             </div>
                             
                             {passwordError && (
-                                <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl text-sm text-center">
+                                <div className="p-3 bg-red-950/50 border border-red-500/50 text-red-400 rounded-xl text-sm text-center">
                                     {passwordError}
                                 </div>
                             )}
                             
                             <button
                                 type="submit"
-                                className="w-full p-4 bg-gradient-to-r from-amber-500 to-orange-600 text-white rounded-xl font-semibold text-lg shadow-lg hover:shadow-xl hover:shadow-amber-500/50 transition-all transform hover:scale-105"
+                                className="w-full p-4 bg-gradient-to-r from-neon-green-500 to-dark-emerald-600 text-deep-black rounded-xl font-semibold text-lg shadow-neon-lg hover:shadow-neon-xl transition-all transform hover:scale-105 animate-glow"
                             >
                                 Unlock
                             </button>
                         </form>
                         
-                        <p className="text-xs text-stone-500 text-center mt-6">
+                        <p className="text-xs text-gray-500 text-center mt-6">
                             This app is private and for authorized users only
                         </p>
                     </div>
@@ -2441,47 +2571,47 @@ export default function App() {
             )}
 
             {/* Header/Status Bar */}
-            <div className="sticky top-0 z-10 p-4 bg-stone-50/70 backdrop-blur-xl border-b border-stone-200/20 shadow-sm flex justify-between items-center">
+            <div className="sticky top-0 z-10 p-4 bg-deep-black-card/70 backdrop-blur-xl border-b border-neon-green-500/20 shadow-neon-sm flex justify-between items-center relative">
                 <div className="flex items-center">
-                    <Moon size={28} className="mr-2 text-amber-600" />
+                    <Moon size={28} className="mr-2 text-neon-green-400 drop-shadow-[0_0_8px_rgba(34,197,94,0.8)]" />
                     <div>
-                        <h1 className="text-xl font-bold bg-gradient-to-r from-amber-700 to-stone-600 bg-clip-text text-transparent">
+                        <h1 className="text-xl font-bold bg-gradient-to-r from-neon-green-400 to-dark-emerald-400 bg-clip-text text-transparent glow-text">
                             {t('appName')}
                         </h1>
-                        <p className="text-xs italic text-rose-600 mt-0.5">
+                        <p className="text-xs italic text-neon-green-400/80 mt-0.5">
                             With all my love for you my Queen ❤️
                         </p>
                     </div>
                 </div>
                 <button
                     onClick={() => setLanguage(language === 'en' ? 'tr' : 'en')}
-                    className="px-4 py-2 text-sm font-semibold rounded-full bg-amber-100/60 backdrop-blur-md text-amber-800 hover:bg-amber-100/80 transition-all border border-amber-200/50 shadow-sm"
+                    className="px-4 py-2 text-sm font-semibold rounded-full bg-dark-emerald-900/60 backdrop-blur-md text-neon-green-400 hover:bg-dark-emerald-800/80 transition-all border border-neon-green-500/30 shadow-neon-sm"
                 >
                     {language === 'en' ? 'TR' : 'EN'}
                 </button>
             </div>
             
-            <div className="p-4 pt-0 bg-stone-50/50 backdrop-blur-md">
-                <p className="text-xs text-stone-600 mt-1">
-                    {t('status')}: {isAuthReady ? t('statusConnected') : t('statusConnecting')}
+            <div className="p-4 pt-0 bg-deep-black-lighter/50 backdrop-blur-md">
+                <p className="text-xs text-gray-400 mt-1">
+                    {t('status')}: {isAuthReady ? <span className="text-neon-green-400">{t('statusConnected')}</span> : <span className="text-gray-500">{t('statusConnecting')}</span>}
                 </p>
                 {/* Status Message Box */}
                 {statusMessage && (
-                    <div className="mt-2 p-3 text-sm bg-amber-50/80 backdrop-blur-sm text-amber-900 rounded-xl border border-amber-100">
+                    <div className="mt-2 p-3 text-sm bg-dark-emerald-900/50 backdrop-blur-sm text-neon-green-400 rounded-xl border border-neon-green-500/30 shadow-neon-sm">
                         {statusMessage}
                     </div>
                 )}
             </div>
 
             {/* Main Content Area */}
-            <main className="flex-grow p-4 overflow-y-auto pb-20">
+            <main className="flex-grow p-4 overflow-y-auto pb-20 relative z-10">
                 <div className="max-w-xl mx-auto">
                     {renderContent()}
                 </div>
             </main>
 
             {/* Mobile Tab Navigation (Footer) */}
-            <div className="fixed bottom-0 left-0 right-0 bg-stone-50/70 backdrop-blur-xl border-t border-stone-200/20 shadow-2xl z-20">
+            <div className="fixed bottom-0 left-0 right-0 bg-deep-black-card/90 backdrop-blur-xl border-t border-neon-green-500/20 shadow-neon-lg z-20">
                 <div className="max-w-xl mx-auto grid grid-cols-8 justify-around">
                     <TabButton icon={Home} label={t("tabQuran")} tabName="Home" />
                     <TabButton icon={CloudSun} label={t("tabPrayer")} tabName="Prayer" />
